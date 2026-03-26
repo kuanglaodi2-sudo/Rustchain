@@ -28,7 +28,9 @@ Proof-of-Antiquity rewards hardware for *surviving*, not for being fast. Older m
 
 | Hardware | Multiplier | Era | Why It Matters |
 |----------|-----------|-----|----------------|
+| Intel 80386 (1985) | **4.0x** | MYTHIC | First 32-bit x86 — 40+ years old |
 | DEC VAX-11/780 (1977) | **3.5x** | MYTHIC | "Shall we play a game?" |
+| Intel 80486 (1989) | **3.5x** | MYTHIC | L1 cache, integrated FPU |
 | Acorn ARM2 (1987) | **4.0x** | MYTHIC | Where ARM began |
 | Inmos Transputer (1984) | **3.5x** | MYTHIC | Parallel computing pioneer |
 | Motorola 68000 (1979) | **3.0x** | LEGENDARY | Amiga, Atari ST, classic Mac |
@@ -59,9 +61,9 @@ curl -sk https://rustchain.org/epoch           # Current epoch
 | Fact | Proof |
 |------|-------|
 | 4 nodes across 2 continents | [Live explorer](https://rustchain.org/explorer) |
-| 11+ miners attesting | `curl -sk https://rustchain.org/api/miners` |
+| 22+ miners attesting | `curl -sk https://rustchain.org/api/miners` |
 | 6 hardware fingerprint checks per machine | [Fingerprint docs](docs/attestation_fuzzing.md) |
-| 24,884 RTC paid to 248 contributors | [Public ledger](https://github.com/Scottcjn/rustchain-bounties/issues/104) |
+| 25,875+ RTC paid to 260+ contributors | [Public ledger](https://github.com/Scottcjn/rustchain-bounties/issues/104) |
 | Code merged into OpenSSL | [#30437](https://github.com/openssl/openssl/pull/30437), [#30452](https://github.com/openssl/openssl/pull/30452) |
 | PRs open on CPython, curl, wolfSSL, Ghidra, vLLM | [Portfolio](https://github.com/Scottcjn/Scottcjn/blob/main/external-pr-portfolio.md) |
 
@@ -219,7 +221,7 @@ Named after a 486 laptop with oxidized serial ports that still boots to DOS and 
 
 *"Mais, it still works, so why you gonna throw it away?"*
 
-[Boudreaux Principles](docs/Boudreaux_COMPUTING_PRINCIPLES.md) · [Green Tracker](https://rustchain.org/preserved.html) · [Bounties](https://github.com/Scottcjn/rustchain-bounties/issues)
+[Boudreaux Principles](https://rustchain.org/principles.html) · [Green Tracker](https://rustchain.org/preserved.html) · [Bounties](https://github.com/Scottcjn/rustchain-bounties/issues)
 
 </div>
 

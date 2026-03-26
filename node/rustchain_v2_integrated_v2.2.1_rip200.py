@@ -135,6 +135,24 @@ except ImportError as _e:
     HAVE_BOTTUBE_FEED = False
     print(f"[BoTTube Feed] Feed module not available: {_e}")
 
+# Issue #2276: Hardware Fingerprint Replay Attack Defense
+try:
+    from hardware_fingerprint_replay import (
+        compute_fingerprint_hash,
+        compute_entropy_profile_hash,
+        check_fingerprint_replay,
+        check_entropy_collision,
+        check_fingerprint_rate_limit,
+        record_fingerprint_submission,
+        detect_fingerprint_anomalies,
+        init_replay_defense_schema
+    )
+    HAVE_REPLAY_DEFENSE = True
+    print("[ISSUE #2276] Hardware fingerprint replay defense loaded")
+except ImportError as _e:
+    HAVE_REPLAY_DEFENSE = False
+    print(f"[ISSUE #2276] Replay defense module not available: {_e}")
+
 app = Flask(__name__)
 # Supports running from repo `node/` dir or a flat deployment directory (e.g. /root/rustchain).
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -324,6 +342,118 @@ def _normalize_attestation_report(report):
         if text is not None:
             normalized[field] = text
     return normalized
+
+
+ATTEST_NONCE_SKEW_SECONDS = int(os.getenv("ATTEST_NONCE_SKEW_SECONDS", "60"))
+_ATTEST_CHALLENGE_NONCE_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+
+
+def attest_ensure_tables(conn):
+    """Create the attestation nonce tables expected by replay protection."""
+    conn.execute("CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, expires_at INTEGER)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS used_nonces (
+            nonce TEXT PRIMARY KEY,
+            miner_id TEXT NOT NULL,
+            first_seen INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_used_nonces_expires_at ON used_nonces(expires_at)")
+
+
+def attest_cleanup_expired(conn, now_ts: Optional[int] = None):
+    """Remove expired challenge and used-nonce rows."""
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
+    attest_ensure_tables(conn)
+    conn.execute("DELETE FROM nonces WHERE expires_at < ?", (now_ts,))
+    conn.execute("DELETE FROM used_nonces WHERE expires_at < ?", (now_ts,))
+    conn.commit()
+
+
+def extract_attestation_timestamp(data: dict, report: dict, nonce: Optional[str]) -> Optional[int]:
+    """Extract an optional attestation timestamp from request payload fields."""
+    for source in (report or {}, data or {}):
+        for field_name in ("nonce_ts", "nonce_timestamp", "timestamp", "server_time"):
+            raw_value = source.get(field_name)
+            if isinstance(raw_value, bool):
+                continue
+            if isinstance(raw_value, (int, float)):
+                if math.isfinite(raw_value):
+                    return int(raw_value)
+                continue
+            if isinstance(raw_value, str) and raw_value.strip().isdigit():
+                return int(raw_value.strip())
+    return None
+
+
+def _attest_nonce_requires_challenge(nonce: str, nonce_ts: Optional[int]) -> bool:
+    """Current challenge endpoint emits 64-hex nonces with no embedded timestamp."""
+    return nonce_ts is None and bool(_ATTEST_CHALLENGE_NONCE_RE.fullmatch(nonce))
+
+
+def attest_validate_challenge(conn, nonce: str, now_ts: Optional[int] = None):
+    """Validate and consume a one-time challenge nonce."""
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
+    attest_cleanup_expired(conn, now_ts=now_ts)
+    row = conn.execute(
+        "SELECT expires_at FROM nonces WHERE nonce = ? AND expires_at >= ?",
+        (nonce, now_ts),
+    ).fetchone()
+    if not row:
+        return False, "challenge_invalid", None
+
+    expires_at = int(row[0])
+    deleted = conn.execute(
+        "DELETE FROM nonces WHERE nonce = ? AND expires_at = ?",
+        (nonce, expires_at),
+    ).rowcount
+    conn.commit()
+    if deleted != 1:
+        return False, "challenge_invalid", None
+    return True, None, expires_at
+
+
+def attest_validate_and_store_nonce(
+    conn,
+    miner: str,
+    nonce: str,
+    now_ts: Optional[int] = None,
+    nonce_ts: Optional[int] = None,
+    skew_seconds: int = ATTEST_NONCE_SKEW_SECONDS,
+):
+    """Reject replayed or stale attestation nonces and persist accepted ones."""
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
+    nonce = _attest_text(nonce)
+    miner = _attest_valid_miner(miner) or _attest_text(miner) or ""
+    if nonce is None:
+        return False, "missing_nonce", None
+
+    attest_cleanup_expired(conn, now_ts=now_ts)
+    replay_row = conn.execute(
+        "SELECT 1 FROM used_nonces WHERE nonce = ?",
+        (nonce,),
+    ).fetchone()
+    if replay_row:
+        return False, "nonce_replay", None
+
+    challenge_expires_at = None
+    if _attest_nonce_requires_challenge(nonce, nonce_ts):
+        ok, err, challenge_expires_at = attest_validate_challenge(conn, nonce, now_ts=now_ts)
+        if not ok:
+            return False, err, None
+    elif nonce_ts is not None and abs(int(nonce_ts) - now_ts) > max(int(skew_seconds), 0):
+        return False, "nonce_stale", None
+
+    expires_at = challenge_expires_at or (now_ts + max(int(skew_seconds), 1))
+    conn.execute(
+        "INSERT INTO used_nonces (nonce, miner_id, first_seen, expires_at) VALUES (?, ?, ?, ?)",
+        (nonce, miner, now_ts, expires_at),
+    )
+    conn.commit()
+    return True, None, expires_at
 
 # Register Hall of Rust blueprint (tables initialized after DB_PATH is set)
 try:
@@ -910,7 +1040,7 @@ def init_db():
     """Initialize all database tables"""
     with sqlite3.connect(DB_PATH) as c:
         # Core tables
-        c.execute("CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, expires_at INTEGER)")
+        attest_ensure_tables(c)
         c.execute("CREATE TABLE IF NOT EXISTS tickets (ticket_id TEXT PRIMARY KEY, expires_at INTEGER, commitment TEXT)")
 
         # Epoch tables
@@ -1102,11 +1232,6 @@ def init_db():
                   (int(time.time()),))
         c.execute("INSERT OR IGNORE INTO gov_threshold(id, threshold) VALUES(1, 3)")
         c.execute("INSERT OR IGNORE INTO checkpoints_meta(k, v) VALUES('chain_id', 'rustchain-mainnet-candidate')")
-        # Beacon protocol table
-        c.execute("CREATE TABLE IF NOT EXISTS beacon_envelopes (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, kind TEXT NOT NULL, nonce TEXT UNIQUE NOT NULL, sig TEXT NOT NULL, pubkey TEXT NOT NULL, payload_hash TEXT NOT NULL, anchored INTEGER DEFAULT 0, created_at INTEGER NOT NULL)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_beacon_anchored ON beacon_envelopes(anchored)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_beacon_agent ON beacon_envelopes(agent_id, created_at)")
-
         # BCOS v2: Blockchain Certified Open Source attestations
         try:
             from bcos_routes import init_bcos_table
@@ -1124,6 +1249,10 @@ def init_db():
             init_lock_ledger_schema(c)
 
         c.commit()
+
+    # Keep Beacon schema migration logic centralized in beacon_anchor.py so
+    # legacy payload hashes are versioned consistently across startup paths.
+    init_beacon_table(DB_PATH)
 
 # Hardware multipliers
 HARDWARE_WEIGHTS = {
@@ -1324,7 +1453,7 @@ def _detect_arm_evidence(device: dict, fingerprint: dict) -> bool:
     return False
 
 
-def _detect_exotic_arch(device: dict) -> dict | None:
+def _detect_exotic_arch(device: dict) -> Optional[dict]:
     """Detect exotic/vintage architectures from machine field and CPU brand.
     Returns {"device_family": ..., "device_arch": ...} or None if not exotic.
     Covers: SPARC, MIPS, RISC-V, Hitachi SH, Motorola 68K, Cell BE,
@@ -2460,6 +2589,52 @@ def _submit_attestation_impl():
             "message": "Too many unique miners from this IP address",
             "code": "IP_RATE_LIMIT"
         }), 429
+
+    if nonce is None:
+        return jsonify({
+            "ok": False,
+            "error": "missing_nonce",
+            "message": "Attestation nonce is required",
+            "code": "MISSING_NONCE"
+        }), 400
+
+    nonce_ts = extract_attestation_timestamp(data, report, nonce)
+    with sqlite3.connect(DB_PATH) as nonce_conn:
+        nonce_ok, nonce_err, _ = attest_validate_and_store_nonce(
+            nonce_conn,
+            miner=miner,
+            nonce=nonce,
+            now_ts=int(time.time()),
+            nonce_ts=nonce_ts,
+        )
+    if not nonce_ok:
+        nonce_messages = {
+            "challenge_invalid": (
+                "challenge_invalid",
+                "Attestation challenge is missing, expired, or already used",
+                "CHALLENGE_INVALID",
+            ),
+            "nonce_replay": (
+                "nonce_replay",
+                "Attestation nonce has already been used",
+                "NONCE_REPLAY",
+            ),
+            "nonce_stale": (
+                "nonce_stale",
+                "Attestation nonce timestamp is outside the allowed skew window",
+                "NONCE_STALE",
+            ),
+        }
+        error_name, message, code = nonce_messages.get(
+            nonce_err,
+            ("invalid_nonce", "Attestation nonce is invalid", "INVALID_NONCE"),
+        )
+        return jsonify({
+            "ok": False,
+            "error": error_name,
+            "message": message,
+            "code": code
+        }), 409
     signals = _normalize_attestation_signals(data.get('signals'))
     fingerprint = _attest_mapping(data.get('fingerprint'))  # NEW: Extract fingerprint
 
@@ -2509,6 +2684,99 @@ def _submit_attestation_impl():
         oui_ok, oui_info = _check_oui_gate(macs)
         if not oui_ok:
             return jsonify(oui_info), 412
+
+    # Issue #2276: Hardware Fingerprint Replay Attack Defense
+    # Check for replay attacks BEFORE validating fingerprint data
+    fingerprint_passed = False  # Initialize before replay defense block
+    replay_blocked = False
+    replay_reason = "not_checked"
+    replay_details = None
+    
+    if HAVE_REPLAY_DEFENSE and fingerprint:
+        # Compute fingerprint and entropy hashes
+        fp_hash = compute_fingerprint_hash(fingerprint)
+        entropy_hash = compute_entropy_profile_hash(fingerprint)
+        hw_id = _compute_hardware_id(device, signals, source_ip=client_ip) if device and signals else None
+        
+        # Check 1: Fingerprint replay detection
+        is_replay, replay_msg, replay_info = check_fingerprint_replay(
+            fingerprint_hash=fp_hash,
+            nonce=nonce,
+            wallet_address=miner,
+            miner_id=miner
+        )
+        
+        if is_replay:
+            replay_blocked = True
+            replay_reason = replay_msg
+            replay_details = replay_info
+            print(f"[REPLAY_DEFENSE #2276] BLOCKED: {miner[:20]}... - {replay_msg}")
+            if replay_info:
+                print(f"[REPLAY_DEFENSE #2276] Details: {replay_info}")
+        
+        # Check 2: Entropy collision detection (if not already blocked)
+        if not replay_blocked:
+            is_collision, coll_msg, coll_info = check_entropy_collision(
+                entropy_profile_hash=entropy_hash,
+                wallet_address=miner,
+                miner_id=miner
+            )
+            
+            if is_collision:
+                replay_blocked = True
+                replay_reason = coll_msg
+                replay_details = coll_info
+                print(f"[REPLAY_DEFENSE #2276] BLOCKED: {miner[:20]}... - entropy collision detected")
+                if coll_info:
+                    print(f"[REPLAY_DEFENSE #2276] Collision: {coll_info}")
+        
+        # Check 3: Rate limiting (if not already blocked)
+        if not replay_blocked:
+            rate_ok, rate_msg, rate_info = check_fingerprint_rate_limit(
+                hardware_id=hw_id,
+                wallet_address=miner
+            )
+            
+            if not rate_ok:
+                replay_blocked = True
+                replay_reason = rate_msg
+                replay_details = rate_info
+                print(f"[REPLAY_DEFENSE #2276] RATE LIMITED: {miner[:20]}... - {rate_msg}")
+        
+        # Check 4: Anomaly detection (logging only, doesn't block)
+        if fingerprint_passed and not replay_blocked:
+            has_anomalies, anomalies = detect_fingerprint_anomalies(
+                miner_id=miner,
+                wallet_address=miner,
+                fingerprint_hash=fp_hash
+            )
+            
+            if has_anomalies:
+                print(f"[REPLAY_DEFENSE #2276] ANOMALY DETECTED: {miner[:20]}...")
+                for anomaly in anomalies:
+                    print(f"[REPLAY_DEFENSE #2276]   - {anomaly.get('type')}: {anomaly.get('description', '')}")
+                # Record anomaly for monitoring (doesn't block attestation)
+        
+        # Record submission for future replay detection (if not blocked)
+        if not replay_blocked:
+            record_fingerprint_submission(
+                fingerprint=fingerprint,
+                nonce=nonce,
+                wallet_address=miner,
+                miner_id=miner,
+                hardware_id=hw_id,
+                attestation_valid=fingerprint_passed
+            )
+    
+    # Return error if replay detected
+    if replay_blocked:
+        return jsonify({
+            "ok": False,
+            "error": replay_reason,
+            "message": "Hardware fingerprint replay attack detected",
+            "details": replay_details,
+            "code": "REPLAY_ATTACK_BLOCKED"
+        }), 409
 
     # NEW: Validate fingerprint data (RIP-PoA)
     # FIX #305: Default to False - must pass validation to earn rewards
@@ -4329,18 +4597,28 @@ def genesis_export():
 
 @app.route('/balance/<miner_pk>', methods=['GET'])
 def get_balance(miner_pk):
-    """Get miner balance - checks both miner_pk and miner_id columns"""
+    """Get miner balance with schema compatibility."""
     with sqlite3.connect(DB_PATH) as c:
-        # Try miner_pk first (old-style wallets), then miner_id (new-style)
-        row = c.execute("SELECT COALESCE(amount_i64, 0) FROM balances WHERE miner_pk = ?", (miner_pk,)).fetchone()
-        if not row or row[0] == 0:
-            row = c.execute("SELECT COALESCE(amount_i64, 0) FROM balances WHERE miner_id = ?", (miner_pk,)).fetchone()
-        balance_i64 = row[0] if row else 0
-        balance_rtc = balance_i64 / 1000000.0
+        cur = c.cursor()
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(balances)").fetchall()}
+
+        balance_i64 = 0
+        if "amount_i64" in cols:
+            row = None
+            if "miner_pk" in cols:
+                row = cur.execute("SELECT COALESCE(amount_i64, 0) FROM balances WHERE miner_pk = ?", (miner_pk,)).fetchone()
+            if (not row or row[0] == 0) and "miner_id" in cols:
+                row = cur.execute("SELECT COALESCE(amount_i64, 0) FROM balances WHERE miner_id = ?", (miner_pk,)).fetchone()
+            balance_i64 = int(row[0]) if row else 0
+        else:
+            # Legacy schema: balances(miner_pk, balance_rtc)
+            row = cur.execute("SELECT COALESCE(balance_rtc, 0.0) FROM balances WHERE miner_pk = ?", (miner_pk,)).fetchone()
+            bal_rtc = float(row[0]) if row else 0.0
+            balance_i64 = int(round(bal_rtc * UNIT))
 
         return jsonify({
             "miner_pk": miner_pk,
-            "balance_rtc": balance_rtc,
+            "balance_rtc": balance_i64 / UNIT,
             "amount_i64": balance_i64
         })
 
@@ -5161,9 +5439,16 @@ def api_wallet_balance():
         return jsonify({"ok": False, "error": "miner_id or address required"}), 400
 
     with sqlite3.connect(DB_PATH) as db:
-        row = db.execute("SELECT amount_i64 FROM balances WHERE miner_id=?", (miner_id,)).fetchone()
+        try:
+            # Newer schema
+            row = db.execute("SELECT amount_i64 FROM balances WHERE miner_id=?", (miner_id,)).fetchone()
+            amt = int(row[0]) if row else 0
+        except sqlite3.OperationalError:
+            # Legacy schema: balances(miner_pk, balance_rtc)
+            row = db.execute("SELECT balance_rtc FROM balances WHERE miner_pk=?", (miner_id,)).fetchone()
+            bal_rtc = float(row[0]) if row else 0.0
+            amt = int(round(bal_rtc * UNIT))
 
-    amt = int(row[0]) if row else 0
     return jsonify({
         "miner_id": miner_id,
         "amount_i64": amt,
@@ -6445,7 +6730,14 @@ def beacon_submit():
 @app.route("/beacon/digest", methods=["GET"])
 def beacon_digest():
     d = compute_beacon_digest(DB_PATH)
-    return jsonify({"ok": True, "digest": d["digest"], "count": d["count"], "latest_ts": d["latest_ts"]})
+    return jsonify({
+        "ok": True,
+        "digest": d["digest"],
+        "count": d["count"],
+        "latest_ts": d["latest_ts"],
+        "payload_hash_versions": d.get("payload_hash_versions", []),
+        "mixed_payload_hash_versions": d.get("mixed_payload_hash_versions", False),
+    })
 
 @app.route("/beacon/envelopes", methods=["GET"])
 def beacon_envelopes_list():

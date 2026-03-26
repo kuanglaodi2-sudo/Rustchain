@@ -118,6 +118,101 @@ impl HardwareInfo {
 fn detect_cpu_family_arch(cpu: &str, machine: &str) -> (String, String) {
     let cpu_lower = cpu.to_lowercase();
 
+    // Intel 386 (1985) - MYTHIC tier, highest antiquity multiplier
+    // Detected when machine arch is 32-bit x86 (i386/i486/i586/i686)
+    // or when CPU string contains "80386", "i386", or "Intel 386"
+    if cpu_lower.contains("80386")
+        || cpu_lower.contains("i386")
+        || cpu_lower.contains("intel 386")
+        || cpu_lower.contains("cyrix 386")
+        || cpu_lower.contains("amd 386")
+        || (machine == "x86" || machine == "i386" || machine == "i486" || machine == "i586" || machine == "i686")
+    {
+        // Classify specific 386 variants
+        if cpu_lower.contains("386dx") || cpu_lower.contains("80386dx") {
+            return ("x86".to_string(), "i386DX".to_string());
+        } else if cpu_lower.contains("386sx") || cpu_lower.contains("80386sx") {
+            return ("x86".to_string(), "i386SX".to_string());
+        } else if cpu_lower.contains("386ex") || cpu_lower.contains("80386ex") {
+            return ("x86".to_string(), "i386EX".to_string());
+        } else if cpu_lower.contains("cyrix") || cpu_lower.contains("cyrix 386") {
+            return ("x86".to_string(), "Cyrix 386".to_string());
+        } else if cpu_lower.contains("amd") && cpu_lower.contains("386") {
+            return ("x86".to_string(), "AMD 386".to_string());
+        }
+        // Default 386 classification
+        return ("x86".to_string(), "i386".to_string());
+    }
+
+    // Intel 486 (1989) - Also MYTHIC tier
+    if cpu_lower.contains("80486")
+        || cpu_lower.contains("i486")
+        || cpu_lower.contains("intel 486")
+        || cpu_lower.contains("amd 486")
+        || cpu_lower.contains("cyrix 486")
+    {
+        if cpu_lower.contains("dx") || cpu_lower.contains("dx2") || cpu_lower.contains("dx4") {
+            return ("x86".to_string(), "i486DX".to_string());
+        } else if cpu_lower.contains("sx") || cpu_lower.contains("sx2") {
+            return ("x86".to_string(), "i486SX".to_string());
+        }
+        return ("x86".to_string(), "i486".to_string());
+    }
+
+    // Intel Pentium (1993) - LEGENDARY tier
+    if cpu_lower.contains("pentium")
+        || cpu_lower.contains("i586")
+        || cpu_lower.contains("intel pentium")
+    {
+        if cpu_lower.contains("mmx") {
+            return ("x86".to_string(), "Pentium MMX".to_string());
+        }
+        return ("x86".to_string(), "Pentium".to_string());
+    }
+
+    // RISC-V (2010+) - Open ISA, emerging vintage hardware
+    if machine.contains("riscv") || machine.contains("risc-v") {
+        // Detect specific RISC-V implementations
+        if cpu_lower.contains("sifive") {
+            if cpu_lower.contains("u74") {
+                return ("RISC-V".to_string(), "SiFive U74".to_string());
+            } else if cpu_lower.contains("u54") {
+                return ("RISC-V".to_string(), "SiFive U54".to_string());
+            } else if cpu_lower.contains("e51") {
+                return ("RISC-V".to_string(), "SiFive E51".to_string());
+            }
+            return ("RISC-V".to_string(), "SiFive".to_string());
+        } else if cpu_lower.contains("starfive") {
+            if cpu_lower.contains("jh7110") {
+                return ("RISC-V".to_string(), "StarFive JH7110".to_string());
+            } else if cpu_lower.contains("jh7100") {
+                return ("RISC-V".to_string(), "StarFive JH7100".to_string());
+            }
+            return ("RISC-V".to_string(), "StarFive".to_string());
+        } else if cpu_lower.contains("visionfive") {
+            return ("RISC-V".to_string(), "VisionFive".to_string());
+        } else if cpu_lower.contains("hifive") {
+            return ("RISC-V".to_string(), "HiFive".to_string());
+        } else if cpu_lower.contains("kendryte") {
+            return ("RISC-V".to_string(), "Kendryte".to_string());
+        } else if cpu_lower.contains("allwinner") {
+            if cpu_lower.contains("d1") || cpu_lower.contains("sunxi") {
+                return ("RISC-V".to_string(), "Allwinner D1".to_string());
+            }
+            return ("RISC-V".to_string(), "Allwinner".to_string());
+        } else if cpu_lower.contains("thead") {
+            if cpu_lower.contains("c910") || cpu_lower.contains("c906") {
+                return ("RISC-V".to_string(), "T-Head C910/C906".to_string());
+            }
+            return ("RISC-V".to_string(), "T-Head".to_string());
+        } else if machine.contains("64") {
+            return ("RISC-V".to_string(), "RISC-V 64-bit".to_string());
+        } else if machine.contains("32") {
+            return ("RISC-V".to_string(), "RISC-V 32-bit".to_string());
+        }
+        return ("RISC-V".to_string(), "Generic".to_string());
+    }
+
     // Apple Silicon (M1/M2/M3/M4)
     if machine == "aarch64" || machine == "arm64" {
         if cpu_lower.contains("m4") {
@@ -165,6 +260,34 @@ fn detect_cpu_family_arch(cpu: &str, machine: &str) -> (String, String) {
             return ("PowerPC".to_string(), "G3".to_string());
         }
         return ("PowerPC".to_string(), "G4".to_string());
+    }
+
+    // ARM (generic, non-Apple)
+    if machine.contains("arm") || machine.contains("aarch") {
+        if cpu_lower.contains("cortex-a72") {
+            return ("ARM".to_string(), "Cortex-A72".to_string());
+        } else if cpu_lower.contains("cortex-a53") {
+            return ("ARM".to_string(), "Cortex-A53".to_string());
+        } else if cpu_lower.contains("cortex-a76") {
+            return ("ARM".to_string(), "Cortex-A76".to_string());
+        } else if cpu_lower.contains("neoverse") {
+            return ("ARM".to_string(), "Neoverse".to_string());
+        }
+        return ("ARM".to_string(), "Generic ARM".to_string());
+    }
+
+    // Intel 386 (1985) - MAXIMUM antiquity multiplier (4.0x)
+    // The CPU that started the x86 era, 40+ years old
+    if machine == "i386" || machine == "x86" {
+        if cpu_lower.contains("386") || cpu_lower.contains("80386") {
+            if cpu_lower.contains("sx") {
+                return ("x86".to_string(), "i386SX".to_string());
+            } else if cpu_lower.contains("dx") {
+                return ("x86".to_string(), "i386DX".to_string());
+            }
+            return ("x86".to_string(), "i386".to_string());
+        }
+        return ("x86".to_string(), "i386".to_string());
     }
 
     // Default
